@@ -26,8 +26,10 @@ COPY . .
 # Build the Vue frontend for production
 RUN npm run build --prefix frontend
 
-# Render exposes a single public HTTP port
+# Render exposes a single public HTTP port. The application reads PORT at runtime.
 EXPOSE 10000
 
-# Run only the production Flask backend; it also serves the built frontend
-CMD ["uv", "run", "--directory", "backend", "python", "run.py"]
+# Start Python directly. Using `uv run` here causes uv to rebuild the local
+# backend package during container startup and can exceed Render's port-scan
+# timeout on the free instance. Dependencies are already installed above.
+CMD ["python", "backend/run.py"]
