@@ -18,8 +18,12 @@ def create_app(config_class=Config):
     """Flask application factory."""
     project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
     frontend_dist = os.path.join(project_root, 'frontend', 'dist')
+    frontend_assets = os.path.join(frontend_dist, 'assets')
 
-    app = Flask(__name__, static_folder=frontend_dist, static_url_path='/assets')
+    # Let Flask's built-in static handler map /assets/* directly to the
+    # Vite-generated assets directory. Previously it mapped /assets/foo.js
+    # to dist/foo.js, while Vite actually generates dist/assets/foo.js.
+    app = Flask(__name__, static_folder=frontend_assets, static_url_path='/assets')
     app.config.from_object(config_class)
 
     if hasattr(app, 'json') and hasattr(app.json, 'ensure_ascii'):
@@ -65,8 +69,8 @@ def create_app(config_class=Config):
         return {'status': 'ok', 'service': 'MiroFish Backend'}
 
     # Serve the compiled Vue application in production.
-    # API routes above take precedence; all other paths fall back to index.html
-    # so Vue Router can handle client-side routes.
+    # API routes and /assets/* take precedence; all other paths fall back to
+    # index.html so Vue Router can handle client-side routes.
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
     def frontend(path):
