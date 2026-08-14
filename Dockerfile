@@ -29,7 +29,7 @@ RUN npm run build --prefix frontend
 # Render exposes a single public HTTP port. The application reads PORT at runtime.
 EXPOSE 10000
 
-# Start Python directly. Using `uv run` here causes uv to rebuild the local
-# backend package during container startup and can exceed Render's port-scan
-# timeout on the free instance. Dependencies are already installed above.
-CMD ["python", "backend/run.py"]
+# uv sync installs the backend into /app/backend/.venv. Start the exact
+# environment created during the image build; using system Python here would
+# omit Flask, Zep, OASIS and the other backend dependencies.
+CMD ["/app/backend/.venv/bin/python", "/app/backend/run.py"]
