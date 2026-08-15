@@ -13,8 +13,12 @@ from .zep import call_zep_read_with_retry
 logger = get_logger("mirofish.zep_paging")
 
 _DEFAULT_PAGE_SIZE = 100
-_DEFAULT_MAX_RETRIES = 3
-_DEFAULT_RETRY_DELAY = 2.0
+# Zep Cloud 5xx responses are transient in practice. Graph visualization and
+# simulation preparation are read-only operations, so a slightly longer,
+# bounded retry policy is safe and prevents a single 502 from breaking the
+# entire workflow.
+_DEFAULT_MAX_RETRIES = 6
+_DEFAULT_RETRY_DELAY = 3.0
 _NEXT_CURSOR_HEADER = "zep-next-cursor"
 
 
