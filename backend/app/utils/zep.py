@@ -127,12 +127,12 @@ def call_zep_read_with_retry(
     operation: Callable[[], T],
     *,
     operation_name: str,
-    max_attempts: int = 3,
-    initial_delay: float = 2.0,
+    max_attempts: int = 6,
+    initial_delay: float = 3.0,
     max_delay: float = 60.0,
     sleep: Callable[[float], None] = time.sleep,
 ) -> T:
-    """Retry a safe Zep read only for transport, 408, 429, or 5xx errors."""
+    """Retry safe Zep reads with bounded backoff for transient failures."""
 
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
