@@ -20,9 +20,6 @@ def _select_diverse_entities(entities, limit):
     if len(entities) <= limit:
         return entities
 
-    # Prefer entities that look like the three intended buyer groups, then
-    # distribute the remaining slots across entity types so one type cannot
-    # consume the whole test population.
     keywords = (
         "marketing", "produto", "product", "pricing", "preço", "price",
         "analista", "analyst", "gestor", "manager", "profissional", "professional"
@@ -38,7 +35,6 @@ def _select_diverse_entities(entities, limit):
 
     ranked = sorted(entities, key=score, reverse=True)
 
-    # Build buckets by entity type while preserving the relevance ranking.
     buckets = {}
     for entity in ranked:
         entity_type = entity.get_entity_type() or "Entity"
@@ -73,13 +69,12 @@ class _PatchLoader(importlib.abc.Loader):
 
 
 class _PatchFinder(importlib.abc.MetaPathFinder):
-    TARGET = "backend.app.services.zep_entity_reader"
+    TARGET = "app.services.zep_entity_reader"
 
     def find_spec(self, fullname, path=None, target=None):
         if fullname != self.TARGET:
             return None
 
-        # Avoid recursively finding the same module through this finder.
         try:
             sys.meta_path.remove(self)
         except ValueError:
@@ -113,9 +108,6 @@ class _PatchFinder(importlib.abc.MetaPathFinder):
             selected = _select_diverse_entities(result.entities, MAX_AGENTS)
             selected_types = {e.get_entity_type() or "Entity" for e in selected}
 
-            # Rebuild the existing dataclass rather than changing the rest of
-            # the simulation pipeline. Every downstream component therefore
-            # sees exactly MAX_AGENTS entities/profiles.
             return module.FilteredEntities(
                 entities=selected,
                 entity_types=selected_types,
@@ -127,6 +119,5 @@ class _PatchFinder(importlib.abc.MetaPathFinder):
         module.ZepEntityReader.filter_defined_entities = limited_filter
 
 
-# Install the hook only when the test limit is enabled.
 if MAX_AGENTS > 0:
     sys.meta_path.insert(0, _PatchFinder())
