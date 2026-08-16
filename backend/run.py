@@ -16,6 +16,10 @@ if sys.platform == 'win32':
 # Add backend directory to the import path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# Temporary validation-only patch: cap this test at 20 simulated agents.
+# Remove this import after validation to restore the production configuration.
+import agent_limit_patch  # noqa: F401,E402
+
 from app import create_app
 from app.config import Config
 
