@@ -125,6 +125,11 @@ LLM_MODEL_NAME=qwen-plus
 # Zep Cloud 配置
 # 每月免费额度即可支撑简单使用：https://app.getzep.com/
 ZEP_API_KEY=your_zep_api_key
+
+# Supabase/Postgres 持久化模拟元数据
+# Render Free 等临时文件系统生产环境需要配置。
+# 启用前请先应用 supabase/migrations 中的 SQL。
+SUPABASE_DATABASE_URL=
 ```
 
 #### 2. 安装依赖

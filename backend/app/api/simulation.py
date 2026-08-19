@@ -244,6 +244,13 @@ def create_simulation():
                 "success": False,
                 "error": t('api.graphNotBuilt')
             }), 400
+
+        project_snapshot = {
+            "project_id": project.project_id,
+            "graph_id": graph_id,
+            "simulation_requirement": project.simulation_requirement,
+            "extracted_text": ProjectManager.get_extracted_text(project_id) or "",
+        }
         
         manager = SimulationManager()
         state = manager.create_simulation(
@@ -251,6 +258,7 @@ def create_simulation():
             graph_id=graph_id,
             enable_twitter=data.get('enable_twitter', True),
             enable_reddit=data.get('enable_reddit', True),
+            project_snapshot=project_snapshot,
         )
         
         return jsonify({
@@ -477,14 +485,21 @@ def prepare_simulation():
         
         # 从项目获取必要信息
         project = ProjectManager.get_project(state.project_id)
+        project_snapshot = None
         if not project:
-            return jsonify({
-                "success": False,
-                "error": t('api.projectNotFound', id=state.project_id)
-            }), 404
+            project_snapshot = manager.get_project_snapshot(simulation_id)
+            if not project_snapshot:
+                return jsonify({
+                    "success": False,
+                    "error": t('api.projectNotFound', id=state.project_id)
+                }), 404
         
         # 获取模拟需求
-        simulation_requirement = project.simulation_requirement or ""
+        simulation_requirement = (
+            project.simulation_requirement
+            if project
+            else project_snapshot.get("simulation_requirement")
+        ) or ""
         if not simulation_requirement:
             return jsonify({
                 "success": False,
@@ -492,7 +507,11 @@ def prepare_simulation():
             }), 400
         
         # 获取文档文本
-        document_text = ProjectManager.get_extracted_text(state.project_id) or ""
+        document_text = (
+            ProjectManager.get_extracted_text(state.project_id)
+            if project
+            else project_snapshot.get("extracted_text")
+        ) or ""
         
         entity_types_list = data.get('entity_types')
         use_llm_for_profiles = data.get('use_llm_for_profiles', True)
@@ -1684,7 +1703,11 @@ def start_simulation():
             # simulation can outlive a project reset/rebuild and must not be
             # used to resurrect writes to a deleted graph.
             project = ProjectManager.get_project(state.project_id)
-            graph_id = project.graph_id if project else None
+            graph_id = (
+                project.graph_id
+                if project
+                else (manager.get_project_snapshot(simulation_id) or {}).get("graph_id")
+            )
             if not graph_id:
                 return jsonify({
                     "success": False,
@@ -1708,7 +1731,9 @@ def start_simulation():
                     else None
                 )
                 current_graph_id = (
-                    refreshed_project.graph_id if refreshed_project else None
+                    refreshed_project.graph_id
+                    if refreshed_project
+                    else (manager.get_project_snapshot(simulation_id) or {}).get("graph_id")
                 )
                 if current_graph_id != graph_id:
                     return jsonify({

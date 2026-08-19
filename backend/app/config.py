@@ -31,6 +31,14 @@ class Config:
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
+
+    # Persistent simulation metadata storage. Use the Supabase/Postgres pooled
+    # connection string in production; DATABASE_URL is accepted for hosts that
+    # expose a conventional Postgres URL.
+    SUPABASE_DATABASE_URL = (
+        os.environ.get('SUPABASE_DATABASE_URL')
+        or os.environ.get('DATABASE_URL')
+    )
     
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB

@@ -366,6 +366,34 @@ class SimulationRunner:
             json.dump(data, f, ensure_ascii=False, indent=2)
         
         cls._run_states[state.simulation_id] = state
+        cls._persist_run_state(state, data)
+
+    @classmethod
+    def _persist_run_state(
+        cls,
+        state: SimulationRunState,
+        data: Dict[str, Any],
+    ) -> None:
+        from .simulation_manager import SimulationManager
+        from .simulation_repository import SimulationRepository
+
+        repository = SimulationRepository()
+        if not repository.enabled:
+            return
+
+        manager = SimulationManager()
+        simulation = manager.get_simulation(state.simulation_id)
+        if simulation is None:
+            return
+
+        repository.upsert(
+            simulation_id=simulation.simulation_id,
+            project_id=simulation.project_id,
+            graph_id=simulation.graph_id,
+            status=simulation.status.value,
+            state=simulation.to_dict(),
+            run_state=data,
+        )
     
     @classmethod
     def start_simulation(

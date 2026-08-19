@@ -125,6 +125,11 @@ LLM_MODEL_NAME=qwen-plus
 # Zep Cloud Configuration
 # Free monthly quota is sufficient for simple usage: https://app.getzep.com/
 ZEP_API_KEY=your_zep_api_key
+
+# Supabase/Postgres persistent simulation metadata
+# Required for production on ephemeral runtimes such as Render Free.
+# Apply supabase/migrations before enabling this value.
+SUPABASE_DATABASE_URL=
 ```
 
 #### 2. Install Dependencies

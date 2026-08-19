@@ -7,6 +7,7 @@ OASIS模拟管理器
 import os
 import json
 import shutil
+import csv
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -17,6 +18,10 @@ from ..utils.logger import get_logger
 from .zep_entity_reader import ZepEntityReader, FilteredEntities
 from .oasis_profile_generator import OasisProfileGenerator, OasisAgentProfile
 from .simulation_config_generator import SimulationConfigGenerator, SimulationParameters
+from .simulation_repository import (
+    PersistedSimulation,
+    SimulationRepository,
+)
 from ..utils.locale import t
 
 logger = get_logger('mirofish.simulation')
@@ -145,14 +150,16 @@ class SimulationManager:
     def __init__(self):
         # 确保目录存在
         os.makedirs(self.SIMULATION_DATA_DIR, exist_ok=True)
+        self.repository = SimulationRepository()
         
         # 内存中的模拟状态缓存
         self._simulations: Dict[str, SimulationState] = {}
     
-    def _get_simulation_dir(self, simulation_id: str) -> str:
+    def _get_simulation_dir(self, simulation_id: str, ensure: bool = True) -> str:
         """获取模拟数据目录"""
         sim_dir = os.path.join(self.SIMULATION_DATA_DIR, simulation_id)
-        os.makedirs(sim_dir, exist_ok=True)
+        if ensure:
+            os.makedirs(sim_dir, exist_ok=True)
         return sim_dir
     
     def _save_simulation_state(self, state: SimulationState):
@@ -166,22 +173,17 @@ class SimulationManager:
             json.dump(state.to_dict(), f, ensure_ascii=False, indent=2)
         
         self._simulations[state.simulation_id] = state
-    
-    def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
-        """从文件加载模拟状态"""
-        if simulation_id in self._simulations:
-            return self._simulations[simulation_id]
-        
-        sim_dir = self._get_simulation_dir(simulation_id)
-        state_file = os.path.join(sim_dir, "state.json")
-        
-        if not os.path.exists(state_file):
-            return None
-        
-        with open(state_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        state = SimulationState(
+
+        self.repository.upsert(
+            simulation_id=state.simulation_id,
+            project_id=state.project_id,
+            graph_id=state.graph_id,
+            status=state.status.value,
+            state=state.to_dict(),
+        )
+
+    def _state_from_dict(self, simulation_id: str, data: Dict[str, Any]) -> SimulationState:
+        return SimulationState(
             simulation_id=simulation_id,
             project_id=data.get("project_id", ""),
             graph_id=data.get("graph_id", ""),
@@ -201,16 +203,140 @@ class SimulationManager:
             updated_at=data.get("updated_at", datetime.now().isoformat()),
             error=data.get("error"),
         )
-        
+
+    def _write_json_if_missing(self, path: str, data: Any):
+        if os.path.exists(path):
+            return
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _write_twitter_profiles_if_missing(
+        self,
+        path: str,
+        profiles: List[Dict[str, Any]],
+    ):
+        if os.path.exists(path) or not profiles:
+            return
+        fieldnames = sorted({key for profile in profiles for key in profile.keys()})
+        with open(path, 'w', encoding='utf-8', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(profiles)
+
+    def _materialize_persisted_simulation(
+        self,
+        record: PersistedSimulation,
+        overwrite_state: bool = False,
+    ) -> SimulationState:
+        """Restore critical local files required by OASIS from durable storage."""
+
+        state_data = record.state or {
+            "simulation_id": record.simulation_id,
+            "project_id": record.project_id,
+            "graph_id": record.graph_id,
+            "status": record.status,
+        }
+        state_data.setdefault("simulation_id", record.simulation_id)
+        state_data.setdefault("project_id", record.project_id)
+        state_data.setdefault("graph_id", record.graph_id)
+        state_data["status"] = record.status or state_data.get("status", "created")
+
+        sim_dir = self._get_simulation_dir(record.simulation_id)
+        state_file = os.path.join(sim_dir, "state.json")
+        if overwrite_state or not os.path.exists(state_file):
+            with open(state_file, 'w', encoding='utf-8') as f:
+                json.dump(state_data, f, ensure_ascii=False, indent=2)
+
+        if record.simulation_config is not None:
+            self._write_json_if_missing(
+                os.path.join(sim_dir, "simulation_config.json"),
+                record.simulation_config,
+            )
+        if record.reddit_profiles is not None:
+            self._write_json_if_missing(
+                os.path.join(sim_dir, "reddit_profiles.json"),
+                record.reddit_profiles,
+            )
+        if record.twitter_profiles is not None:
+            self._write_twitter_profiles_if_missing(
+                os.path.join(sim_dir, "twitter_profiles.csv"),
+                record.twitter_profiles,
+            )
+
+        state = self._state_from_dict(record.simulation_id, state_data)
+        self._simulations[record.simulation_id] = state
+        return state
+
+    def _read_json_file(self, path: str) -> Optional[Any]:
+        if not os.path.exists(path):
+            return None
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _read_profiles_file(self, simulation_id: str, platform: str) -> Optional[List[Dict[str, Any]]]:
+        sim_dir = self._get_simulation_dir(simulation_id)
+        if platform == "reddit":
+            return self._read_json_file(os.path.join(sim_dir, "reddit_profiles.json"))
+
+        profile_path = os.path.join(sim_dir, "twitter_profiles.csv")
+        if not os.path.exists(profile_path):
+            return None
+        with open(profile_path, 'r', encoding='utf-8', newline='') as f:
+            return list(csv.DictReader(f))
+
+    def _persist_artifacts(
+        self,
+        state: SimulationState,
+        *,
+        simulation_config: Optional[Dict[str, Any]] = None,
+        project_snapshot: Optional[Dict[str, Any]] = None,
+    ):
+        reddit_profiles = self._read_profiles_file(state.simulation_id, "reddit")
+        twitter_profiles = self._read_profiles_file(state.simulation_id, "twitter")
+        self.repository.upsert(
+            simulation_id=state.simulation_id,
+            project_id=state.project_id,
+            graph_id=state.graph_id,
+            status=state.status.value,
+            state=state.to_dict(),
+            simulation_config=simulation_config,
+            reddit_profiles=reddit_profiles,
+            twitter_profiles=twitter_profiles,
+            project_snapshot=project_snapshot,
+        )
+
+    def _load_simulation_state(self, simulation_id: str) -> Optional[SimulationState]:
+        """从文件加载模拟状态"""
+        if simulation_id in self._simulations:
+            return self._simulations[simulation_id]
+
+        if self.repository.enabled:
+            record = self.repository.get(simulation_id)
+            if record:
+                return self._materialize_persisted_simulation(record)
+            return None
+
+        sim_dir = self._get_simulation_dir(simulation_id, ensure=False)
+        state_file = os.path.join(sim_dir, "state.json")
+
+        if not os.path.exists(state_file):
+            return None
+
+        with open(state_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        state = self._state_from_dict(simulation_id, data)
+
         self._simulations[simulation_id] = state
         return state
-    
+
     def create_simulation(
         self,
         project_id: str,
         graph_id: str,
         enable_twitter: bool = True,
         enable_reddit: bool = True,
+        project_snapshot: Optional[Dict[str, Any]] = None,
     ) -> SimulationState:
         """
         创建新的模拟
@@ -237,6 +363,15 @@ class SimulationManager:
         )
         
         self._save_simulation_state(state)
+        if project_snapshot is not None:
+            self.repository.upsert(
+                simulation_id=state.simulation_id,
+                project_id=state.project_id,
+                graph_id=state.graph_id,
+                status=state.status.value,
+                state=state.to_dict(),
+                project_snapshot=project_snapshot,
+            )
         logger.info(f"创建模拟: {simulation_id}, project={project_id}, graph={graph_id}")
         
         return state
@@ -443,6 +578,7 @@ class SimulationManager:
             config_path = os.path.join(sim_dir, "simulation_config.json")
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.write(sim_params.to_json())
+            simulation_config = json.loads(sim_params.to_json())
             
             state.config_generated = True
             state.config_reasoning = sim_params.generation_reasoning
@@ -461,6 +597,7 @@ class SimulationManager:
             # 更新状态
             state.status = SimulationStatus.READY
             self._save_simulation_state(state)
+            self._persist_artifacts(state, simulation_config=simulation_config)
             
             logger.info(f"模拟准备完成: {simulation_id}, "
                        f"entities={state.entities_count}, profiles={state.profiles_count}")
@@ -495,6 +632,13 @@ class SimulationManager:
                 if state:
                     if project_id is None or state.project_id == project_id:
                         simulations.append(state)
+
+        if self.repository.enabled:
+            persisted_ids = {sim.simulation_id for sim in simulations}
+            for record in self.repository.list(project_id=project_id):
+                if record.simulation_id in persisted_ids:
+                    continue
+                simulations.append(self._materialize_persisted_simulation(record))
         
         return simulations
     
@@ -517,6 +661,12 @@ class SimulationManager:
         )
         
         if not os.path.exists(profile_path):
+            if self.repository.enabled:
+                record = self.repository.get(simulation_id)
+                if record:
+                    self._materialize_persisted_simulation(record)
+                    if os.path.exists(profile_path):
+                        return self.get_profiles(simulation_id, platform=platform)
             return []
 
         if platform == "twitter":
@@ -534,10 +684,21 @@ class SimulationManager:
         config_path = os.path.join(sim_dir, "simulation_config.json")
         
         if not os.path.exists(config_path):
+            if self.repository.enabled:
+                record = self.repository.get(simulation_id)
+                if record and record.simulation_config is not None:
+                    self._materialize_persisted_simulation(record)
+                    return record.simulation_config
             return None
         
         with open(config_path, 'r', encoding='utf-8') as f:
             return json.load(f)
+
+    def get_project_snapshot(self, simulation_id: str) -> Optional[Dict[str, Any]]:
+        if not self.repository.enabled:
+            return None
+        record = self.repository.get(simulation_id)
+        return record.project_snapshot if record else None
     
     def get_run_instructions(self, simulation_id: str) -> Dict[str, str]:
         """获取运行说明"""
