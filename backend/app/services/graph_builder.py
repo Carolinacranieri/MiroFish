@@ -30,6 +30,8 @@ from ..utils.zep import (
 from .text_processor import TextProcessor
 from ..utils.locale import t, get_locale, set_locale
 
+DIRECT_INGESTION_MAX_CHUNKS = 50
+
 
 @dataclass
 class GraphInfo:
@@ -168,15 +170,26 @@ class GraphBuilderService:
                 message=t('progress.textSplit', count=total_chunks)
             )
             
-            # 4. 分批发送数据
-            submission = self.add_text_batches(
-                graph_id, chunks, batch_size,
-                lambda msg, prog: self.task_manager.update_task(
-                    task_id,
-                    progress=20 + int(prog * 0.4),  # 20-60%
-                    message=msg
-                )
+            # 4. 发送数据
+            add_progress = lambda msg, prog: self.task_manager.update_task(
+                task_id,
+                progress=20 + int(prog * 0.4),  # 20-60%
+                message=msg
             )
+            if total_chunks <= DIRECT_INGESTION_MAX_CHUNKS:
+                episode_uuids = self.add_text_direct(
+                    graph_id,
+                    chunks,
+                    add_progress,
+                )
+                submission = None
+            else:
+                submission = self.add_text_batches(
+                    graph_id,
+                    chunks,
+                    batch_size,
+                    add_progress,
+                )
             
             # 5. 等待Zep处理完成
             self.task_manager.update_task(
@@ -185,14 +198,21 @@ class GraphBuilderService:
                 message=t('progress.waitingZepProcess')
             )
             
-            self._wait_for_batch(
-                submission,
-                lambda msg, prog: self.task_manager.update_task(
-                    task_id,
-                    progress=60 + int(prog * 0.3),  # 60-90%
-                    message=msg
-                )
+            wait_progress = lambda msg, prog: self.task_manager.update_task(
+                task_id,
+                progress=60 + int(prog * 0.3),  # 60-90%
+                message=msg
             )
+            if submission is not None:
+                self._wait_for_batch(
+                    submission,
+                    wait_progress,
+                )
+            else:
+                self._wait_for_episodes(
+                    episode_uuids,
+                    wait_progress,
+                )
             
             # 6. 获取图谱信息
             self.task_manager.update_task(
@@ -563,6 +583,62 @@ class GraphBuilderService:
             item_count=total_chunks,
         )
 
+    def add_text_direct(
+        self,
+        graph_id: str,
+        chunks: List[str],
+        progress_callback: Optional[Callable] = None,
+    ) -> List[str]:
+        """Submit small graph builds through direct graph.add ingestion."""
+
+        if not graph_id:
+            raise ValueError("graph_id is required")
+        self.validate_batch_chunks(chunks, batch_size=min(len(chunks), 350))
+
+        episode_uuids: List[str] = []
+        total_chunks = len(chunks)
+        operation_id = self.build_operation_id(graph_id, chunks)
+
+        for index, chunk in enumerate(chunks):
+            if progress_callback:
+                progress_callback(
+                    (
+                        f"Sending source chunk {index + 1}/{total_chunks} "
+                        "through direct Zep ingestion"
+                    ),
+                    index / total_chunks,
+                )
+
+            episode = self.client.graph.add(
+                graph_id=graph_id,
+                type="text",
+                data=chunk,
+                source_description="MiroFish source document chunk",
+                metadata={
+                    "mirofish_operation_id": operation_id,
+                    "chunk_index": index,
+                    "chunk_sha256": hashlib.sha256(
+                        chunk.encode("utf-8")
+                    ).hexdigest(),
+                    "ingestion_mode": "direct",
+                },
+            )
+
+            episode_uuid = (
+                getattr(episode, "uuid_", None)
+                or getattr(episode, "uuid", None)
+            )
+            if not episode_uuid:
+                raise RuntimeError("Zep graph.add returned no episode UUID")
+            episode_uuids.append(str(episode_uuid))
+
+        if progress_callback:
+            progress_callback(
+                f"Submitted {total_chunks} source chunks through direct Zep ingestion",
+                1.0,
+            )
+        return episode_uuids
+
     @staticmethod
     def validate_batch_chunks(chunks: List[str], *, batch_size: int = 350) -> None:
         """Validate every Batch API limit before the first Cloud mutation."""
@@ -639,11 +715,19 @@ class GraphBuilderService:
         timeout = timeout or ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
         start_time = time.time()
         terminal_states = {"succeeded", "partial", "failed", "invalid", "canceled"}
+        last_status = None
+        last_progress = None
 
         while True:
             if time.time() - start_time > timeout:
+                detail = self._format_batch_progress(
+                    last_status,
+                    last_progress,
+                    fallback_total=submission.item_count,
+                )
                 raise TimeoutError(
-                    f"Zep batch {submission.batch_id} did not finish within {timeout}s"
+                    f"Zep batch {submission.batch_id} did not finish within "
+                    f"{timeout}s; {detail}"
                 )
 
             summary = call_zep_read_with_retry(
@@ -652,16 +736,16 @@ class GraphBuilderService:
             )
             status = getattr(summary, "status", None)
             progress = getattr(summary, "progress", None)
+            last_status = status
+            last_progress = progress
             percent = float(getattr(progress, "percent_complete", 0) or 0) / 100
             if progress_callback:
                 completed = int(getattr(progress, "succeeded_items", 0) or 0)
                 progress_callback(
-                    t(
-                        'progress.zepProcessing',
-                        completed=completed,
-                        total=submission.item_count,
-                        pending=max(submission.item_count - completed, 0),
-                        elapsed=int(time.time() - start_time),
+                    (
+                        f"Zep batch {submission.batch_id} status={status or 'unknown'}; "
+                        f"{self._format_batch_progress(progress=progress, fallback_total=submission.item_count)}; "
+                        f"elapsed={int(time.time() - start_time)}s"
                     ),
                     min(max(percent, 0.0), 1.0),
                 )
@@ -716,6 +800,35 @@ class GraphBuilderService:
                 1.0,
             )
         return episode_uuids
+
+    @staticmethod
+    def _format_batch_progress(
+        status: Any = None,
+        progress: Any = None,
+        *,
+        fallback_total: int,
+    ) -> str:
+        total = int(getattr(progress, "total_items", 0) or fallback_total or 0)
+        queued = int(getattr(progress, "queued_items", 0) or 0)
+        processing = int(getattr(progress, "processing_items", 0) or 0)
+        succeeded = int(getattr(progress, "succeeded_items", 0) or 0)
+        failed = int(getattr(progress, "failed_items", 0) or 0)
+        skipped = int(getattr(progress, "skipped_items", 0) or 0)
+        canceled = int(getattr(progress, "canceled_items", 0) or 0)
+        pending = max(total - succeeded - failed - skipped - canceled, 0)
+        parts = []
+        if status is not None:
+            parts.append(f"status={status}")
+        parts.extend([
+            f"done={succeeded}/{total}",
+            f"pending={pending}",
+            f"queued={queued}",
+            f"processing={processing}",
+            f"failed={failed}",
+            f"skipped={skipped}",
+            f"canceled={canceled}",
+        ])
+        return ", ".join(parts)
     
     def _wait_for_episodes(
         self,

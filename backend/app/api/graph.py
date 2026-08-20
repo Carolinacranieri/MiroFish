@@ -14,7 +14,11 @@ from zep_cloud import NotFoundError
 from . import graph_bp
 from ..config import Config
 from ..services.ontology_generator import OntologyGenerator
-from ..services.graph_builder import BatchSubmission, GraphBuilderService
+from ..services.graph_builder import (
+    BatchSubmission,
+    DIRECT_INGESTION_MAX_CHUNKS,
+    GraphBuilderService,
+)
 from ..services.text_processor import TextProcessor
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
@@ -676,6 +680,13 @@ def _build_graph_impl():
                 builder.validate_batch_chunks(chunks, batch_size=350)
                 total_chunks = len(chunks)
                 
+                use_direct_ingestion = (
+                    not resume_existing_batch
+                    and total_chunks <= DIRECT_INGESTION_MAX_CHUNKS
+                )
+                batch_submission = None
+                direct_episode_uuids = []
+
                 if resume_existing_batch:
                     graph_id = project.graph_id
                     operation_id = builder.build_operation_id(graph_id, chunks)
@@ -683,7 +694,7 @@ def _build_graph_impl():
                         raise RuntimeError(
                             "Persisted Zep batch does not match the current graph input"
                         )
-                    submission = BatchSubmission(
+                    batch_submission = BatchSubmission(
                         batch_id=project.zep_batch_id,
                         operation_id=operation_id,
                         episode_uuids=[],
@@ -728,24 +739,38 @@ def _build_graph_impl():
                             progress=progress
                         )
 
-                    task_manager.update_task(
-                        task_id,
-                        message=t('progress.addingChunks', count=total_chunks),
-                        progress=15
-                    )
+                    if use_direct_ingestion:
+                        task_manager.update_task(
+                            task_id,
+                            message=(
+                                f"Adding {total_chunks} chunks with direct Zep ingestion"
+                            ),
+                            progress=15
+                        )
+                        direct_episode_uuids = builder.add_text_direct(
+                            graph_id,
+                            chunks,
+                            progress_callback=add_progress_callback,
+                        )
+                    else:
+                        task_manager.update_task(
+                            task_id,
+                            message=t('progress.addingChunks', count=total_chunks),
+                            progress=15
+                        )
 
-                    def remember_batch(batch_id, operation_id):
-                        project.zep_batch_id = batch_id
-                        project.zep_batch_operation_id = operation_id
-                        ProjectManager.save_project(project)
+                        def remember_batch(batch_id, operation_id):
+                            project.zep_batch_id = batch_id
+                            project.zep_batch_operation_id = operation_id
+                            ProjectManager.save_project(project)
 
-                    submission = builder.add_text_batches(
-                        graph_id,
-                        chunks,
-                        batch_size=350,
-                        progress_callback=add_progress_callback,
-                        batch_created_callback=remember_batch,
-                    )
+                        batch_submission = builder.add_text_batches(
+                            graph_id,
+                            chunks,
+                            batch_size=350,
+                            progress_callback=add_progress_callback,
+                            batch_created_callback=remember_batch,
+                        )
                 
                 # 等待Zep处理完成（查询每个episode的processed状态）
                 task_manager.update_task(
@@ -762,7 +787,13 @@ def _build_graph_impl():
                         progress=progress
                     )
                 
-                builder._wait_for_batch(submission, wait_progress_callback)
+                if batch_submission is not None:
+                    builder._wait_for_batch(batch_submission, wait_progress_callback)
+                else:
+                    builder._wait_for_episodes(
+                        direct_episode_uuids,
+                        wait_progress_callback,
+                    )
                 
                 # 获取图谱数据
                 task_manager.update_task(
@@ -794,7 +825,14 @@ def _build_graph_impl():
                             "node_count": node_count,
                             "edge_count": edge_count,
                             "chunk_count": total_chunks,
-                            "zep_batch_id": submission.batch_id,
+                            "zep_batch_id": (
+                                batch_submission.batch_id
+                                if batch_submission is not None
+                                else None
+                            ),
+                            "zep_ingestion_mode": (
+                                "batch" if batch_submission is not None else "direct"
+                            ),
                         }
                     )
                 

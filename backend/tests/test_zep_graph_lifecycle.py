@@ -244,6 +244,99 @@ def test_stale_build_resumes_a_persisted_processing_batch(monkeypatch):
     assert len(created_threads) == 1
 
 
+def test_small_graph_build_uses_direct_ingestion(monkeypatch):
+    project = _project(ProjectStatus.ONTOLOGY_GENERATED, graph_id=None)
+    project.zep_batch_id = None
+    project.zep_batch_operation_id = None
+    events = []
+    created_threads = []
+
+    class Tasks:
+        def create_task(self, _description):
+            events.append(("task", "create"))
+            return "task-direct"
+
+        def update_task(self, task_id, **kwargs):
+            events.append(("task", task_id, kwargs))
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def validate_batch_chunks(self, chunks, *, batch_size):
+            events.append(("validate", len(chunks), batch_size))
+
+        def create_graph(self, *, name, graph_id_callback):
+            graph_id_callback("graph-direct")
+            events.append(("graph", name))
+            return "graph-direct"
+
+        def set_ontology(self, graph_id, ontology):
+            events.append(("ontology", graph_id, ontology))
+
+        def add_text_direct(self, graph_id, chunks, progress_callback):
+            events.append(("direct", graph_id, len(chunks)))
+            progress_callback("direct progress", 1.0)
+            return ["episode-1"]
+
+        def add_text_batches(self, *_args, **_kwargs):
+            raise AssertionError("small build should not use Batch API")
+
+        def _wait_for_episodes(self, episode_uuids, progress_callback):
+            events.append(("wait-episodes", episode_uuids))
+            progress_callback("episodes done", 1.0)
+
+        def _wait_for_batch(self, *_args, **_kwargs):
+            raise AssertionError("small build should not wait on Batch API")
+
+        def get_graph_data(self, graph_id):
+            events.append(("data", graph_id))
+            return {"node_count": 1, "edge_count": 2}
+
+    class Thread:
+        def __init__(self, *, target, daemon):
+            created_threads.append(target)
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api, "TaskManager", Tasks)
+    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
+    monkeypatch.setattr(graph_api.threading, "Thread", Thread)
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_project",
+        classmethod(lambda _cls, _project_id: project),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "get_extracted_text",
+        classmethod(lambda _cls, _project_id: "short source text"),
+    )
+    monkeypatch.setattr(
+        graph_api.ProjectManager,
+        "save_project",
+        classmethod(lambda _cls, saved: events.append(("save", saved.status))),
+    )
+
+    app = Flask(__name__)
+    with app.test_request_context(
+        "/api/graph/build",
+        method="POST",
+        json={"project_id": "proj-1"},
+    ):
+        body, status = _json_result(graph_api.build_graph())
+
+    assert status == 200
+    assert body["data"]["task_id"] == "task-direct"
+    assert len(created_threads) == 1
+    created_threads[0]()
+    assert ("direct", "graph-direct", 1) in events
+    assert ("wait-episodes", ["episode-1"]) in events
+    assert project.status == ProjectStatus.GRAPH_COMPLETED
+
+
 def test_project_delete_removes_cloud_graph_before_local_files(monkeypatch):
     project = _project(ProjectStatus.GRAPH_COMPLETED)
     events = []

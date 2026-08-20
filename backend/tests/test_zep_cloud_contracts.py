@@ -234,6 +234,36 @@ def test_document_ingestion_uses_current_batch_api_and_persists_identity():
     assert all(item.data_type == "text" for item in items)
 
 
+def test_small_document_direct_ingestion_uses_graph_add():
+    calls = []
+
+    class GraphApi:
+        def add(self, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(uuid_=f"episode-{len(calls)}")
+
+    builder = object.__new__(GraphBuilderService)
+    builder.client = SimpleNamespace(graph=GraphApi())
+    progress = []
+
+    episode_uuids = builder.add_text_direct(
+        "graph-id",
+        ["chunk one", "chunk two"],
+        progress_callback=lambda message, ratio: progress.append((message, ratio)),
+    )
+
+    assert episode_uuids == ["episode-1", "episode-2"]
+    assert [call["graph_id"] for call in calls] == ["graph-id", "graph-id"]
+    assert [call["type"] for call in calls] == ["text", "text"]
+    assert [call["data"] for call in calls] == ["chunk one", "chunk two"]
+    assert [call["metadata"]["chunk_index"] for call in calls] == [0, 1]
+    assert all(call["metadata"]["ingestion_mode"] == "direct" for call in calls)
+    assert progress[-1] == (
+        "Submitted 2 source chunks through direct Zep ingestion",
+        1.0,
+    )
+
+
 def test_graph_create_persists_identity_before_post_and_reconciles_timeout():
     events = []
 
@@ -419,18 +449,32 @@ def test_batch_wait_times_out_while_status_remains_nonterminal(monkeypatch):
     builder = object.__new__(GraphBuilderService)
     builder.client = SimpleNamespace(
         batch=SimpleNamespace(
-            get=lambda **_kwargs: SimpleNamespace(status="processing", progress=None)
+            get=lambda **_kwargs: SimpleNamespace(
+                status="processing",
+                progress=SimpleNamespace(
+                    total_items=3,
+                    queued_items=2,
+                    processing_items=1,
+                    succeeded_items=0,
+                    failed_items=0,
+                    skipped_items=0,
+                    canceled_items=0,
+                ),
+            )
         )
     )
-    timestamps = iter([0.0, 2.0])
+    timestamps = iter([0.0, 0.0, 2.0])
     monkeypatch.setattr(graph_builder_module.time, "time", lambda: next(timestamps))
     monkeypatch.setattr(graph_builder_module.time, "sleep", lambda _seconds: None)
 
-    with pytest.raises(TimeoutError, match="batch-1"):
+    with pytest.raises(TimeoutError) as error:
         builder._wait_for_batch(
-            BatchSubmission("batch-1", "operation", [], 1),
+            BatchSubmission("batch-1", "operation", [], 3),
             timeout=1,
         )
+    assert "status=processing" in str(error.value)
+    assert "queued=2" in str(error.value)
+    assert "processing=1" in str(error.value)
 
 
 def test_installed_sdk_serializes_the_batch_325_contract():
