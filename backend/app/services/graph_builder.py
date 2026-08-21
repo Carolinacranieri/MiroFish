@@ -31,6 +31,7 @@ from .text_processor import TextProcessor
 from ..utils.locale import t, get_locale, set_locale
 
 DIRECT_INGESTION_MAX_CHUNKS = 50
+DIRECT_INGESTION_MAX_EPISODE_CHARS = 9_500
 
 
 @dataclass
@@ -598,27 +599,32 @@ class GraphBuilderService:
         episode_uuids: List[str] = []
         total_chunks = len(chunks)
         operation_id = self.build_operation_id(graph_id, chunks)
+        episodes = self._pack_direct_ingestion_chunks(chunks)
+        submitted_chunks = 0
 
-        for index, chunk in enumerate(chunks):
+        for episode_index, (chunk_indexes, episode_text) in enumerate(episodes):
             if progress_callback:
                 progress_callback(
                     (
-                        f"Sending source chunk {index + 1}/{total_chunks} "
-                        "through direct Zep ingestion"
+                        f"Sending direct Zep episode {episode_index + 1}/"
+                        f"{len(episodes)} covering source chunks "
+                        f"{chunk_indexes[0] + 1}-{chunk_indexes[-1] + 1}"
                     ),
-                    index / total_chunks,
+                    submitted_chunks / total_chunks,
                 )
 
             episode = self.client.graph.add(
                 graph_id=graph_id,
                 type="text",
-                data=chunk,
+                data=episode_text,
                 source_description="MiroFish source document chunk",
                 metadata={
                     "mirofish_operation_id": operation_id,
-                    "chunk_index": index,
+                    "chunk_index": chunk_indexes[0],
+                    "chunk_indexes": ",".join(str(index) for index in chunk_indexes),
+                    "chunk_count": len(chunk_indexes),
                     "chunk_sha256": hashlib.sha256(
-                        chunk.encode("utf-8")
+                        episode_text.encode("utf-8")
                     ).hexdigest(),
                     "ingestion_mode": "direct",
                 },
@@ -631,13 +637,60 @@ class GraphBuilderService:
             if not episode_uuid:
                 raise RuntimeError("Zep graph.add returned no episode UUID")
             episode_uuids.append(str(episode_uuid))
+            submitted_chunks += len(chunk_indexes)
 
         if progress_callback:
             progress_callback(
-                f"Submitted {total_chunks} source chunks through direct Zep ingestion",
+                (
+                    f"Submitted {total_chunks} source chunks as "
+                    f"{len(episodes)} direct Zep episode(s)"
+                ),
                 1.0,
             )
         return episode_uuids
+
+    @staticmethod
+    def _pack_direct_ingestion_chunks(
+        chunks: List[str],
+        *,
+        max_episode_chars: int = DIRECT_INGESTION_MAX_EPISODE_CHARS,
+    ) -> List[tuple[List[int], str]]:
+        """Pack adjacent chunks into fewer graph.add episodes under Zep limits."""
+
+        if max_episode_chars < 1:
+            raise ValueError("max_episode_chars must be positive")
+
+        packed: List[tuple[List[int], str]] = []
+        current_indexes: List[int] = []
+        current_parts: List[str] = []
+        current_length = 0
+
+        for index, chunk in enumerate(chunks):
+            header = f"\n\n--- Source chunk {index + 1}/{len(chunks)} ---\n"
+            part = f"{header}{chunk}" if current_parts else chunk
+            part_length = len(part)
+
+            if part_length > max_episode_chars:
+                raise ValueError(
+                    f"Direct Zep episode exceeds {max_episode_chars} characters "
+                    f"at chunk {index}"
+                )
+
+            if current_parts and current_length + part_length > max_episode_chars:
+                packed.append((current_indexes, "".join(current_parts)))
+                current_indexes = []
+                current_parts = []
+                current_length = 0
+                part = chunk
+                part_length = len(part)
+
+            current_indexes.append(index)
+            current_parts.append(part)
+            current_length += part_length
+
+        if current_parts:
+            packed.append((current_indexes, "".join(current_parts)))
+        return packed
 
     @staticmethod
     def validate_batch_chunks(chunks: List[str], *, batch_size: int = 350) -> None:

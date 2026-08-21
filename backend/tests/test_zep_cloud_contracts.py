@@ -252,16 +252,34 @@ def test_small_document_direct_ingestion_uses_graph_add():
         progress_callback=lambda message, ratio: progress.append((message, ratio)),
     )
 
-    assert episode_uuids == ["episode-1", "episode-2"]
-    assert [call["graph_id"] for call in calls] == ["graph-id", "graph-id"]
-    assert [call["type"] for call in calls] == ["text", "text"]
-    assert [call["data"] for call in calls] == ["chunk one", "chunk two"]
-    assert [call["metadata"]["chunk_index"] for call in calls] == [0, 1]
+    assert episode_uuids == ["episode-1"]
+    assert [call["graph_id"] for call in calls] == ["graph-id"]
+    assert [call["type"] for call in calls] == ["text"]
+    assert calls[0]["data"] == (
+        "chunk one\n\n--- Source chunk 2/2 ---\nchunk two"
+    )
+    assert calls[0]["metadata"]["chunk_index"] == 0
+    assert calls[0]["metadata"]["chunk_indexes"] == "0,1"
+    assert calls[0]["metadata"]["chunk_count"] == 2
     assert all(call["metadata"]["ingestion_mode"] == "direct" for call in calls)
     assert progress[-1] == (
-        "Submitted 2 source chunks through direct Zep ingestion",
+        "Submitted 2 source chunks as 1 direct Zep episode(s)",
         1.0,
     )
+
+
+def test_direct_ingestion_packs_chunks_under_episode_size_limit():
+    packed = GraphBuilderService._pack_direct_ingestion_chunks(
+        ["a" * 4, "b" * 4, "c" * 4],
+        max_episode_chars=40,
+    )
+
+    assert len(packed) == 2
+    assert packed[0][0] == [0, 1]
+    assert packed[1][0] == [2]
+    assert "--- Source chunk 2/3 ---" in packed[0][1]
+    assert len(packed[0][1]) <= 40
+    assert len(packed[1][1]) <= 40
 
 
 def test_graph_create_persists_identity_before_post_and_reconciles_timeout():
