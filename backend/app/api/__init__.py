@@ -12,11 +12,16 @@ report_bp = Blueprint('report', __name__)
 
 def _recover_orphaned_simulation_run():
     """Fail closed when a previous runtime died with an active simulation."""
-    path_parts = request.path.rstrip('/').split('/')
-    if len(path_parts) < 2 or path_parts[-1] not in {'run-status', 'run-status/detail'}:
+    path = request.path.rstrip('/')
+    if path.endswith('/run-status/detail'):
+        parts = path.split('/')
+        simulation_id = parts[-3] if len(parts) >= 3 else None
+    elif path.endswith('/run-status'):
+        parts = path.split('/')
+        simulation_id = parts[-2] if len(parts) >= 2 else None
+    else:
         return None
 
-    simulation_id = path_parts[-2] if path_parts[-1] in {'run-status', 'run-status/detail'} else None
     if not simulation_id or not simulation_id.startswith('sim_'):
         return None
 
