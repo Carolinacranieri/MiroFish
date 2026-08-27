@@ -1,1 +1,43 @@
-test
+name: Patch Zep episode diagnostics
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/patch-zep-diagnostics.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Patch graph builder
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path("backend/app/services/graph_builder.py")
+          text = path.read_text(encoding="utf-8")
+          start = text.index("    def _wait_for_episodes(")
+          end = text.index("    def _get_graph_info(", start)
+          replacement = '''    def _wait_for_episodes(\n        self,\n        episode_uuids: List[str],\n        progress_callback: Optional[Callable] = None,\n        timeout: int = ZEP_INGESTION_WAIT_TIMEOUT_SECONDS\n    ):\n        """Wait for Zep episodes and expose detailed processing diagnostics."""\n        if not episode_uuids:\n            if progress_callback:\n                progress_callback(t('progress.noEpisodesWait'), 1.0)\n            return\n        start_time = time.time()\n        pending_episodes = set(episode_uuids)\n        completed_count = 0\n        total_episodes = len(episode_uuids)\n        last_diagnostics: Dict[str, Any] = {}\n        if progress_callback:\n            progress_callback(t('progress.waitingEpisodes', count=total_episodes), 0)\n        while pending_episodes:\n            if time.time() - start_time > timeout:\n                diagnostics = "; ".join(f"{uuid}: {data}" for uuid, data in last_diagnostics.items() if uuid in pending_episodes)\n                if progress_callback:\n                    progress_callback(f"Zep episode processing timeout: {completed_count}/{total_episodes} done; pending={len(pending_episodes)}; diagnostics={diagnostics or 'unavailable'}", completed_count / total_episodes if total_episodes > 0 else 0)\n                raise TimeoutError(f"Zep episode processing timed out with {len(pending_episodes)} episode(s) still pending; diagnostics={diagnostics or 'unavailable'}")\n            for ep_uuid in list(pending_episodes):\n                episode = call_zep_read_with_retry(lambda ep_uuid=ep_uuid: self.client.graph.episode.get(uuid_=ep_uuid), operation_name=f"poll episode {ep_uuid}")\n                processed = bool(getattr(episode, "processed", False))\n                status = getattr(episode, "status", None)\n                state = getattr(episode, "state", None)\n                error = getattr(episode, "error", None)\n                message = getattr(episode, "message", None)\n                diagnostic: Dict[str, Any] = {"processed": processed, "status": status, "state": state, "error": error, "message": message, "type": type(episode).__name__}\n                try:\n                    if hasattr(episode, "model_dump"):\n                        raw_data = episode.model_dump()\n                    elif hasattr(episode, "dict"):\n                        raw_data = episode.dict()\n                    else:\n                        raw_data = None\n                    if isinstance(raw_data, dict):\n                        diagnostic["raw"] = raw_data\n                        processed = bool(raw_data.get("processed", processed))\n                        status = raw_data.get("status", status)\n                        state = raw_data.get("state", state)\n                        error = raw_data.get("error", error)\n                        message = raw_data.get("message", message)\n                except Exception as diagnostic_error:\n                    diagnostic["diagnostic_error"] = str(diagnostic_error)\n                diagnostic.update({"processed": processed, "status": status, "state": state, "error": error, "message": message})\n                last_diagnostics[ep_uuid] = diagnostic\n                status_text = str(status or state or "").lower()\n                if error or status_text in {"failed", "error", "invalid", "canceled", "cancelled"}:\n                    raise RuntimeError(f"Zep episode {ep_uuid} failed processing: status={status!r}; state={state!r}; error={error!r}; message={message!r}; details={diagnostic!r}")\n                if processed:\n                    pending_episodes.remove(ep_uuid)\n                    completed_count += 1\n            elapsed = int(time.time() - start_time)\n            if progress_callback:\n                pending_details = "; ".join(f"{uuid}: status={data.get('status')!r}, state={data.get('state')!r}, processed={data.get('processed')!r}, error={data.get('error')!r}, message={data.get('message')!r}" for uuid, data in last_diagnostics.items() if uuid in pending_episodes)\n                progress_callback(f"Zep processing... {completed_count}/{total_episodes} done, {len(pending_episodes)} pending ({elapsed}s); {pending_details or 'no pending episode details'}", completed_count / total_episodes if total_episodes > 0 else 0)\n            if pending_episodes:\n                time.sleep(3)\n        if progress_callback:\n            progress_callback(t('progress.processingComplete', completed=completed_count, total=total_episodes), 1.0)\n\n'''
+          path.write_text(text[:start] + replacement + text[end:], encoding="utf-8", newline="\n")
+          compile(path.read_text(encoding="utf-8"), str(path), "exec")
+          PY
+
+      - name: Validate, commit and remove temporary workflow
+        run: |
+          git diff --check
+          python -m py_compile backend/app/services/graph_builder.py
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add backend/app/services/graph_builder.py
+          git rm .github/workflows/patch-zep-diagnostics.yml
+          git commit -m "Add Zep episode processing diagnostics"
+          git push origin HEAD:main
