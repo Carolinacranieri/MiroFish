@@ -889,57 +889,65 @@ class GraphBuilderService:
         progress_callback: Optional[Callable] = None,
         timeout: int = ZEP_INGESTION_WAIT_TIMEOUT_SECONDS
     ):
-        """等待所有 episode 处理完成（通过查询每个 episode 的 processed 状态）"""
+        """Wait for Zep episodes and expose detailed processing diagnostics."""
         if not episode_uuids:
             if progress_callback:
                 progress_callback(t('progress.noEpisodesWait'), 1.0)
             return
-        
         start_time = time.time()
         pending_episodes = set(episode_uuids)
         completed_count = 0
         total_episodes = len(episode_uuids)
-        
+        last_diagnostics: Dict[str, Any] = {}
         if progress_callback:
             progress_callback(t('progress.waitingEpisodes', count=total_episodes), 0)
-        
         while pending_episodes:
             if time.time() - start_time > timeout:
+                diagnostics = "; ".join(f"{uuid}: {data}" for uuid, data in last_diagnostics.items() if uuid in pending_episodes)
                 if progress_callback:
-                    progress_callback(
-                        t('progress.episodesTimeout', completed=completed_count, total=total_episodes),
-                        completed_count / total_episodes
-                    )
-                raise TimeoutError(
-                    f"Zep episode processing timed out with "
-                    f"{len(pending_episodes)} episode(s) still pending"
-                )
-            
-            # 检查每个 episode 的处理状态
+                    progress_callback(f"Zep episode processing timeout: {completed_count}/{total_episodes} done; pending={len(pending_episodes)}; diagnostics={diagnostics or 'unavailable'}", completed_count / total_episodes if total_episodes > 0 else 0)
+                raise TimeoutError(f"Zep episode processing timed out with {len(pending_episodes)} episode(s) still pending; diagnostics={diagnostics or 'unavailable'}")
             for ep_uuid in list(pending_episodes):
-                episode = call_zep_read_with_retry(
-                    lambda: self.client.graph.episode.get(uuid_=ep_uuid),
-                    operation_name=f"poll episode {ep_uuid}",
-                )
-                is_processed = getattr(episode, 'processed', False)
-
-                if is_processed:
+                episode = call_zep_read_with_retry(lambda ep_uuid=ep_uuid: self.client.graph.episode.get(uuid_=ep_uuid), operation_name=f"poll episode {ep_uuid}")
+                processed = bool(getattr(episode, "processed", False))
+                status = getattr(episode, "status", None)
+                state = getattr(episode, "state", None)
+                error = getattr(episode, "error", None)
+                message = getattr(episode, "message", None)
+                diagnostic: Dict[str, Any] = {"processed": processed, "status": status, "state": state, "error": error, "message": message, "type": type(episode).__name__}
+                try:
+                    if hasattr(episode, "model_dump"):
+                        raw_data = episode.model_dump()
+                    elif hasattr(episode, "dict"):
+                        raw_data = episode.dict()
+                    else:
+                        raw_data = None
+                    if isinstance(raw_data, dict):
+                        diagnostic["raw"] = raw_data
+                        processed = bool(raw_data.get("processed", processed))
+                        status = raw_data.get("status", status)
+                        state = raw_data.get("state", state)
+                        error = raw_data.get("error", error)
+                        message = raw_data.get("message", message)
+                except Exception as diagnostic_error:
+                    diagnostic["diagnostic_error"] = str(diagnostic_error)
+                diagnostic.update({"processed": processed, "status": status, "state": state, "error": error, "message": message})
+                last_diagnostics[ep_uuid] = diagnostic
+                status_text = str(status or state or "").lower()
+                if error or status_text in {"failed", "error", "invalid", "canceled", "cancelled"}:
+                    raise RuntimeError(f"Zep episode {ep_uuid} failed processing: status={status!r}; state={state!r}; error={error!r}; message={message!r}; details={diagnostic!r}")
+                if processed:
                     pending_episodes.remove(ep_uuid)
                     completed_count += 1
-            
             elapsed = int(time.time() - start_time)
             if progress_callback:
-                progress_callback(
-                    t('progress.zepProcessing', completed=completed_count, total=total_episodes, pending=len(pending_episodes), elapsed=elapsed),
-                    completed_count / total_episodes if total_episodes > 0 else 0
-                )
-            
+                pending_details = "; ".join(f"{uuid}: status={data.get('status')!r}, state={data.get('state')!r}, processed={data.get('processed')!r}, error={data.get('error')!r}, message={data.get('message')!r}" for uuid, data in last_diagnostics.items() if uuid in pending_episodes)
+                progress_callback(f"Zep processing... {completed_count}/{total_episodes} done, {len(pending_episodes)} pending ({elapsed}s); {pending_details or 'no pending episode details'}", completed_count / total_episodes if total_episodes > 0 else 0)
             if pending_episodes:
-                time.sleep(3)  # 每3秒检查一次
-        
+                time.sleep(3)
         if progress_callback:
             progress_callback(t('progress.processingComplete', completed=completed_count, total=total_episodes), 1.0)
-    
+
     def _get_graph_info(self, graph_id: str) -> GraphInfo:
         """获取图谱信息"""
         # 获取节点（分页）
