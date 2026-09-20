@@ -1153,9 +1153,17 @@ async def run_twitter_simulation(
         os.remove(db_path)
     
     # The free/small Render instance has very limited CPU. Running both
-    # platforms with the old default of 5 concurrent LLM calls each could
-    # starve the web process and make /health exceed Render's 5s timeout.
+    # platforms with high LLM concurrency can starve the web process and make
+    # /health exceed Render's 5s timeout. Respect an explicit override on
+    # larger instances, but cap it at 2 per platform on Render <= 0.5 CPU.
     llm_concurrency = max(1, int(os.environ.get("OASIS_LLM_CONCURRENCY", "2")))
+    if os.environ.get("RENDER") == "true":
+        try:
+            render_cpu = float(os.environ.get("RENDER_CPU_COUNT", "1"))
+            if render_cpu <= 0.5:
+                llm_concurrency = min(llm_concurrency, 2)
+        except ValueError:
+            pass
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.TWITTER,
@@ -1348,9 +1356,17 @@ async def run_reddit_simulation(
         os.remove(db_path)
     
     # The free/small Render instance has very limited CPU. Running both
-    # platforms with the old default of 5 concurrent LLM calls each could
-    # starve the web process and make /health exceed Render's 5s timeout.
+    # platforms with high LLM concurrency can starve the web process and make
+    # /health exceed Render's 5s timeout. Respect an explicit override on
+    # larger instances, but cap it at 2 per platform on Render <= 0.5 CPU.
     llm_concurrency = max(1, int(os.environ.get("OASIS_LLM_CONCURRENCY", "2")))
+    if os.environ.get("RENDER") == "true":
+        try:
+            render_cpu = float(os.environ.get("RENDER_CPU_COUNT", "1"))
+            if render_cpu <= 0.5:
+                llm_concurrency = min(llm_concurrency, 2)
+        except ValueError:
+            pass
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.REDDIT,
