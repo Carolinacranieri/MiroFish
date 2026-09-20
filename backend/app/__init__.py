@@ -48,6 +48,11 @@ def create_app(config_class=Config):
 
     @app.before_request
     def log_request():
+        # Render probes /health frequently. Keep this path free of request
+        # logging so health checks remain as cheap as possible under the
+        # constrained CPU available on small instances.
+        if request.path == '/health':
+            return
         logger = get_logger('mirofish.request')
         logger.debug(f"Request: {request.method} {request.path}")
         if request.content_type and 'json' in request.content_type:
@@ -55,6 +60,8 @@ def create_app(config_class=Config):
 
     @app.after_request
     def log_response(response):
+        if request.path == '/health':
+            return response
         logger = get_logger('mirofish.request')
         logger.debug(f"Response: {response.status_code}")
         return response
@@ -66,7 +73,9 @@ def create_app(config_class=Config):
 
     @app.route('/health')
     def health():
-        return {'status': 'ok', 'service': 'MiroFish Backend'}
+        # Intentionally dependency-free: Render uses this endpoint as the
+        # liveness probe and expects a 2xx response within five seconds.
+        return 'ok', 200
 
     # Serve the compiled Vue application in production.
     # API routes and /assets/* take precedence; all other paths fall back to
