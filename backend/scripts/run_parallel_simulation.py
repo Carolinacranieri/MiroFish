@@ -1152,11 +1152,12 @@ async def run_twitter_simulation(
     if os.path.exists(db_path):
         os.remove(db_path)
     
+    llm_concurrency = max(1, int(os.environ.get("OASIS_LLM_CONCURRENCY", "5")))
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.TWITTER,
         database_path=db_path,
-        semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
+        semaphore=llm_concurrency,
     )
     
     await result.env.reset()
@@ -1343,11 +1344,12 @@ async def run_reddit_simulation(
     if os.path.exists(db_path):
         os.remove(db_path)
     
+    llm_concurrency = max(1, int(os.environ.get("OASIS_LLM_CONCURRENCY", "5")))
     result.env = oasis.make(
         agent_graph=result.agent_graph,
         platform=oasis.DefaultPlatformType.REDDIT,
         database_path=db_path,
-        semaphore=30,  # 限制最大并发 LLM 请求数，防止 API 过载
+        semaphore=llm_concurrency,
     )
     
     await result.env.reset()
