@@ -576,6 +576,24 @@ class SimulationRunner:
                 start_new_session=True,  # 创建新进程组，确保服务器关闭时能终止所有相关进程
             )
             
+
+            # On Linux/Render, lower the simulation subprocess CPU priority
+            # so the lightweight Flask health endpoint can still be scheduled
+            # on constrained instances. Best-effort; simulation logic is unchanged.
+            if hasattr(os, 'setpriority') and hasattr(os, 'PRIO_PROCESS'):
+                try:
+                    os.setpriority(os.PRIO_PROCESS, process.pid, 10)
+                    logger.info(
+                        "Prioridade de CPU da simulação reduzida: simulation_id=%s, pid=%s",
+                        simulation_id,
+                        process.pid,
+                    )
+                except (OSError, PermissionError) as priority_error:
+                    logger.warning(
+                        "Não foi possível ajustar prioridade da simulação: %s",
+                        priority_error,
+                    )
+
             # Capture locale before spawning monitor thread
             current_locale = get_locale()
 
