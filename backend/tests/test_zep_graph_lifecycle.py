@@ -3,6 +3,7 @@ import threading
 
 from flask import Flask
 from types import SimpleNamespace
+from zep_cloud.core.api_error import ApiError as ZepApiError
 
 from app.api import graph as graph_api
 from app.api import simulation as simulation_api
@@ -33,6 +34,12 @@ def _json_result(result):
     else:
         response, status = result, result.status_code
     return response.get_json(), status
+
+
+def _clear_graph_data_cache():
+    with graph_api._graph_data_cache_guard:
+        graph_api._graph_data_cache.clear()
+        graph_api._graph_data_fetch_locks.clear()
 
 
 def test_project_reset_deletes_the_cloud_graph_before_clearing_reference(monkeypatch):
@@ -335,6 +342,120 @@ def test_small_graph_build_uses_direct_ingestion(monkeypatch):
     assert ("direct", "graph-direct", 1) in events
     assert ("wait-episodes", ["episode-1"]) in events
     assert project.status == ProjectStatus.GRAPH_COMPLETED
+
+
+def test_graph_data_refresh_uses_cached_data_within_ttl(monkeypatch):
+    _clear_graph_data_cache()
+    calls = []
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_graph_data(self, graph_id):
+            calls.append(graph_id)
+            return {
+                "graph_id": graph_id,
+                "nodes": [],
+                "edges": [],
+                "node_count": 0,
+                "edge_count": 0,
+            }
+
+    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
+
+    app = Flask(__name__)
+    with app.test_request_context("/api/graph/data/graph-1", method="GET"):
+        body, status = _json_result(graph_api.get_graph_data("graph-1"))
+    with app.test_request_context("/api/graph/data/graph-1", method="GET"):
+        cached_body, cached_status = _json_result(
+            graph_api.get_graph_data("graph-1")
+        )
+
+    assert status == 200
+    assert cached_status == 200
+    assert calls == ["graph-1"]
+    assert body["cached"] is False
+    assert cached_body["cached"] is True
+    assert cached_body["data"]["graph_id"] == "graph-1"
+    _clear_graph_data_cache()
+
+
+def test_graph_data_refresh_serves_stale_cache_after_zep_rate_limit(monkeypatch):
+    _clear_graph_data_cache()
+    graph_data = {
+        "graph_id": "graph-1",
+        "nodes": [{"uuid": "node-1"}],
+        "edges": [],
+        "node_count": 1,
+        "edge_count": 0,
+    }
+    now = 1000.0
+    monkeypatch.setattr(graph_api.time, "monotonic", lambda: now)
+    graph_api._store_graph_data_cache("graph-1", graph_data)
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_graph_data(self, _graph_id):
+            raise ZepApiError(status_code=429, body={"message": "rate limited"})
+
+    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
+    monkeypatch.setattr(graph_api.time, "monotonic", lambda: now + 45.0)
+
+    app = Flask(__name__)
+    with app.test_request_context("/api/graph/data/graph-1", method="GET"):
+        body, status = _json_result(graph_api.get_graph_data("graph-1"))
+
+    assert status == 200
+    assert body["success"] is True
+    assert body["cached"] is True
+    assert body["stale"] is True
+    assert body["data"] == graph_data
+    _clear_graph_data_cache()
+
+
+def test_graph_data_refresh_does_not_queue_behind_active_fetch(monkeypatch):
+    _clear_graph_data_cache()
+    graph_data = {
+        "graph_id": "graph-1",
+        "nodes": [],
+        "edges": [],
+        "node_count": 0,
+        "edge_count": 0,
+    }
+    now = 2000.0
+    monkeypatch.setattr(graph_api.time, "monotonic", lambda: now)
+    graph_api._store_graph_data_cache("graph-1", graph_data)
+    monkeypatch.setattr(graph_api.time, "monotonic", lambda: now + 45.0)
+
+    class Builder:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get_graph_data(self, _graph_id):
+            raise AssertionError("request should use stale cache immediately")
+
+    monkeypatch.setattr(graph_api.Config, "ZEP_API_KEY", "test-key")
+    monkeypatch.setattr(graph_api, "GraphBuilderService", Builder)
+
+    fetch_lock = graph_api._graph_data_fetch_lock("graph-1")
+    fetch_lock.acquire()
+    try:
+        app = Flask(__name__)
+        with app.test_request_context("/api/graph/data/graph-1", method="GET"):
+            body, status = _json_result(graph_api.get_graph_data("graph-1"))
+    finally:
+        fetch_lock.release()
+
+    assert status == 200
+    assert body["cached"] is True
+    assert body["stale"] is True
+    assert body["data"] == graph_data
+    _clear_graph_data_cache()
 
 
 def test_project_delete_removes_cloud_graph_before_local_files(monkeypatch):

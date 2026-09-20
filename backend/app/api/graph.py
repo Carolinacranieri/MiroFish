@@ -5,11 +5,14 @@
 
 import os
 import re
+import time
 import traceback
 import threading
 from contextlib import ExitStack, nullcontext
+from typing import Any
 from flask import request, jsonify
 from zep_cloud import NotFoundError
+from zep_cloud.core.api_error import ApiError as ZepApiError
 
 from . import graph_bp
 from ..config import Config
@@ -35,6 +38,48 @@ from ..utils.llm_client import LLMResponseError
 logger = get_logger('mirofish.api')
 _build_locks: dict[str, threading.Lock] = {}
 _build_locks_guard = threading.Lock()
+_GRAPH_DATA_CACHE_TTL_SECONDS = 30.0
+_GRAPH_DATA_STALE_IF_ERROR_SECONDS = 300.0
+_graph_data_cache: dict[str, dict[str, Any]] = {}
+_graph_data_cache_guard = threading.Lock()
+_graph_data_fetch_locks: dict[str, threading.Lock] = {}
+
+
+def _graph_data_fetch_lock(graph_id: str) -> threading.Lock:
+    with _graph_data_cache_guard:
+        return _graph_data_fetch_locks.setdefault(graph_id, threading.Lock())
+
+
+def _get_graph_data_cache_entry(graph_id: str) -> dict[str, Any] | None:
+    with _graph_data_cache_guard:
+        return _graph_data_cache.get(graph_id)
+
+
+def _store_graph_data_cache(graph_id: str, graph_data: dict[str, Any]) -> None:
+    with _graph_data_cache_guard:
+        _graph_data_cache[graph_id] = {
+            "data": graph_data,
+            "created_at": time.monotonic(),
+        }
+
+
+def _cached_graph_response(
+    entry: dict[str, Any],
+    *,
+    stale: bool = False,
+    warning: str | None = None,
+):
+    age_seconds = max(0.0, time.monotonic() - float(entry["created_at"]))
+    payload = {
+        "success": True,
+        "data": entry["data"],
+        "cached": True,
+        "stale": stale,
+        "cache_age_seconds": round(age_seconds, 3),
+    }
+    if warning:
+        payload["warning"] = warning
+    return jsonify(payload)
 
 
 class GraphInUseError(RuntimeError):
@@ -802,6 +847,7 @@ def _build_graph_impl():
                     progress=95
                 )
                 graph_data = builder.get_graph_data(graph_id)
+                _store_graph_data_cache(graph_id, graph_data)
                 
                 node_count = graph_data.get("node_count", 0)
                 edge_count = graph_data.get("edge_count", 0)
@@ -925,21 +971,68 @@ def get_graph_data(graph_id: str):
                 "success": False,
                 "error": t('api.zepApiKeyMissing')
             }), 500
-        
-        builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
-        graph_data = builder.get_graph_data(graph_id)
-        
+
+        cached = _get_graph_data_cache_entry(graph_id)
+        if cached is not None:
+            age_seconds = time.monotonic() - float(cached["created_at"])
+            if age_seconds < _GRAPH_DATA_CACHE_TTL_SECONDS:
+                return _cached_graph_response(cached)
+
+        fetch_lock = _graph_data_fetch_lock(graph_id)
+        lock_acquired = fetch_lock.acquire(blocking=cached is None)
+        if not lock_acquired:
+            return _cached_graph_response(cached, stale=True)
+
+        try:
+            cached = _get_graph_data_cache_entry(graph_id)
+            if cached is not None:
+                age_seconds = time.monotonic() - float(cached["created_at"])
+                if age_seconds < _GRAPH_DATA_CACHE_TTL_SECONDS:
+                    return _cached_graph_response(cached)
+
+            builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
+            graph_data = builder.get_graph_data(graph_id)
+            _store_graph_data_cache(graph_id, graph_data)
+        finally:
+            fetch_lock.release()
+
         return jsonify({
             "success": True,
-            "data": graph_data
+            "data": graph_data,
+            "cached": False,
+            "stale": False,
         })
         
     except Exception as e:
+        cached = _get_graph_data_cache_entry(graph_id)
+        if cached is not None:
+            age_seconds = time.monotonic() - float(cached["created_at"])
+            if age_seconds <= _GRAPH_DATA_STALE_IF_ERROR_SECONDS:
+                logger.warning(
+                    "Serving stale graph data for %s after Zep read failure: %s",
+                    graph_id,
+                    type(e).__name__,
+                )
+                return _cached_graph_response(
+                    cached,
+                    stale=True,
+                    warning=(
+                        "Serving cached graph data because the latest Zep read "
+                        "is temporarily unavailable"
+                    ),
+                )
+
+        status_code = getattr(e, "status_code", None)
+        response_status = (
+            status_code
+            if isinstance(e, ZepApiError) and status_code in {408, 429}
+            else 500
+        )
         return jsonify({
             "success": False,
             "error": str(e),
             "traceback": traceback.format_exc()
-        }), 500
+        }), response_status
 
 
 @graph_bp.route('/delete/<graph_id>', methods=['DELETE'])
